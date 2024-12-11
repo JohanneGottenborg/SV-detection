@@ -1,0 +1,272 @@
+from gwf import *
+
+#######################################
+#
+# GWF workflow to analyze genomes
+#
+# How to run:
+# conda config --append channels gwforg
+# conda create -n gwf -y gwf
+# conda activate gwf
+# gwf -f 04.workflow_gwf.py status
+#
+#######################################
+
+gwf = Workflow(defaults={'nodes': 1, 'queue':"normal", 'account':"Coregonus"})
+
+
+#######
+#######
+
+# Defining functions for each step
+
+#######
+#######
+
+def make_directories(output_folder, outputs):
+    inputs = [output_folder]
+    outputs = outputs
+    options = {'cores':4, 'memory': "128g", 'walltime':"4:00:00"}
+    spec = f'''
+
+mkdir {outputs[0]}
+mkdir {outputs[1]}
+mkdir {outputs[1]}/bam_w_header
+mkdir {outputs[2]}
+mkdir {outputs[3]}
+mkdir {outputs[4]}
+'''
+    return AnonymousTarget(inputs=inputs, outputs=outputs, options=options, spec=spec)
+
+
+
+def delly(ID, output_folder, ref_genome, outputs):
+    inputs = [
+        f'../zebra_bam_files/{ID}_noPCRdupl.bam', # path to BAM file of mapped reads
+        ref_genome]
+    options = {'cores':4, 'memory': "128g", 'walltime':"4:00:00"}
+    spec = f'''
+source $(conda info --base)/etc/profile.d/conda.sh
+conda activate delly_env
+
+delly call -g {ref_genome} {inputs[0]}  > {outputs}
+'''
+    return AnonymousTarget(inputs=inputs, outputs=outputs, options=options, spec=spec)
+
+
+def smoove(ID, output_folder, ref_genome, outputs):
+    inputs = [
+        f'../zebra_bam_files/{ID}_noPCRdupl.bam', # path to BAM file of mapped reads
+        ref_genome]
+    options = {'cores':4, 'memory': "128g", 'walltime':"4:00:00"}
+    spec = f'''
+source $(conda info --base)/etc/profile.d/conda.sh
+conda activate smoove_env
+
+samtools addreplacerg -r 'ID: Zebra' -r 'SM:{ID}' -o  {output_folder}/bam_w_header/{ID}_wRG.bam {inputs[0]}
+
+samtools index "{output_folder}/bam_w_header/{ID}_wRG.bam"
+
+smoove call --outdir {output_folder} --name {ID} --fasta {ref_genome} -p 1 --genotype "{output_folder}/bam_w_header/{ID}_wRG.bam"
+
+gunzip '{output_folder}/{ID}-smoove.genotyped.vcf.gz'
+
+'''
+    return AnonymousTarget(inputs=inputs, outputs=outputs, options=options, spec=spec)
+  
+
+
+def manta(ID, output_folder, ref_genome, outputs):
+    inputs = [
+        f'../zebra_bam_files/{ID}_noPCRdupl.bam', # Path to BAM file of mapped reads
+        ref_genome]
+    options = {'cores':8, 'memory': "128g", 'walltime':"24:00:00"}
+    spec = f'''
+source $(conda info --base)/etc/profile.d/conda.sh
+conda activate manta_env
+
+mkdir {output_folder}/{ID}
+
+configManta.py \
+  --bam ../zebra_bam_files/{ID}_noPCRdupl.bam \
+  --referenceFasta {ref_genome} \
+  --runDir "{output_folder}/{ID}"
+
+python {output_folder}/{ID}/runWorkflow.py -j 8
+
+gunzip {output_folder}/{ID}/results/variants/candidateSmallIndels.vcf.gz
+
+gunzip {output_folder}/{ID}/results/variants/candidateSV.vcf.gz
+
+'''
+    return AnonymousTarget(inputs=inputs, outputs=outputs, options=options, spec=spec)
+
+
+def survivor(ID, output_folder, inputs, outputs): 
+    inputs = inputs
+    outputs = outputs
+    options = {'cores':4, 'memory': "128g", 'walltime':"4:00:00"}
+    spec = f'''
+source $(conda info --base)/etc/profile.d/conda.sh
+conda activate survivor_env
+
+ls {inputs[0]} {inputs[1]} {inputs[2]} {inputs[3]} > "{output_folder}/{ID}_vcfs"
+
+SURVIVOR merge "{output_folder}/{ID}_vcfs" 1000 2 1 1 0 10 {outputs[0]} 
+
+SURVIVOR stats '{output_folder}/{ID}_merged.vcf' -1 -1 -1 {outputs[1]}
+
+'''
+    return AnonymousTarget(inputs=inputs, outputs=outputs, options=options, spec=spec)
+
+# This will merge all the vcf files specified in sample_files together using a maximum allowed distance of 1kb, as measured pairwise between breakpoints (begin1 vs begin2, end1 vs end2). Furthermore we ask SURVIVOR only to report calls supported by 2 callers and they have to agree on the type (1) and on the strand (1) of the SV. Note you can change this behavior by altering the numbers from 1 to e.g. 0. In addition, we told SURVIVOR to only compare SV that are at least 10bp long and print the output in sample_merged.vcf.
+
+def removing_unmapped_contigs(ID, output_folder, outputs, inputs):
+    inputs = inputs
+    outputs = outputs
+    options = {'cores':4, 'memory': "128g", 'walltime':"4:00:00"}
+    spec = f'''
+source $(conda info --base)/etc/profile.d/conda.sh
+conda activate bcftools_env
+
+cp {inputs} {output_folder}/{ID}_merged_copy.vcf
+
+bgzip {output_folder}/{ID}_merged_copy.vcf
+
+bcftools sort {output_folder}/{ID}_merged_copy.vcf.gz -Oz -o {output_folder}/{ID}_merged_sorted.vcf.gz
+
+tabix -p vcf {output_folder}/{ID}_merged_sorted.vcf.gz 
+
+bcftools view -r NC_068355.1,NC_068356.1,NC_068357.1,NC_068358.1,NC_068359.1,NC_068360.1,NC_068361.1,NC_068362.1,NC_068363.1,NC_068364.1,NC_068365.1,NC_068366.1,NC_068367.1,NC_068368.1,NC_068369.1,NC_068370.1 {output_folder}/{ID}_merged_sorted.vcf.gz -Oz -o {outputs}
+
+'''
+    return AnonymousTarget(inputs=inputs, outputs=outputs, options=options, spec=spec)
+
+
+def filtering_w_survivor(ID, output_folder, inputs, outputs):
+    inputs = inputs
+    outputs = outputs
+    options = {'cores':1, 'memory': "128g", 'walltime':"12:00:00"}
+    spec = f'''
+source $(conda info --base)/etc/profile.d/conda.sh
+conda activate topics_in_bioinformatics
+
+samtools view -H {inputs[0]} > {output_folder}/{ID}_lowMQ.sam
+samtools view {inputs[0]} | awk '$5<5 {{print $0}}' >>  {output_folder}/{ID}_lowMQ.sam
+samtools view -S -b -h {output_folder}/{ID}_lowMQ.sam > {output_folder}/{ID}_lowMQ.bam
+
+samtools depth {output_folder}/{ID}_lowMQ.bam >  {output_folder}/{ID}_lowMQ.cov
+
+conda deactivate
+
+source $(conda info --base)/etc/profile.d/conda.sh
+conda activate survivor_env
+
+SURVIVOR bincov {output_folder}/{ID}_lowMQ.cov 10 2 > {output_folder}/{ID}_lowMQ.bed
+
+cp {inputs[1]} {output_folder}/{ID}_filtered_contigs_copy.vcf.gz
+
+gunzip {output_folder}/{ID}_filtered_contigs_copy.vcf.gz
+
+SURVIVOR filter '{output_folder}/{ID}_filtered_contigs_copy.vcf' {output_folder}/{ID}_lowMQ.bed 30 -1 0.01 2 {outputs}
+
+SURVIVOR stats {outputs} -1 -1 -1 '{output_folder}/{ID}_summary'
+
+'''
+    return AnonymousTarget(inputs=inputs, outputs=outputs, options=options, spec=spec)
+
+
+
+#######
+#######
+
+# Actually calling the targets
+
+#######
+#######
+
+
+### Setting up directories for output files
+workflow_folder = "../complete_workflow_test" # Path to output folder of entire workflow
+
+T0 = gwf.target_from_template("make_directories", make_directories(output_folder = workflow_folder,
+    outputs = [f'{workflow_folder}/delly_output',
+               f'{workflow_folder}/smoove_output',
+               f'{workflow_folder}/manta_output',
+               f'{workflow_folder}/survivor_output',
+               f'{workflow_folder}/filtering_output']))
+
+
+
+### Running software on sample files
+
+## List of sampls IDs
+# inds = ['FAAR1', 'FAAR5', 'FAAR6', 'FAAR7', 'FAAR9', 'FAAR10', 'FAAR11', 'FAAR12',
+# 'BRAS4', 'BRAS6', 'BRAS7', 'BRAS13', 'BRAS14', 'BRAS15', 'BRAS18', 'BRAS19',
+# 'JELS1', 'JELS3', 'JELS4', 'JELS6', 'JELS7', 'JELS8', 'JELS9', 'JELS10',
+# 'JUL1', 'JUL2', 'JUL3', 'JUL4', 'JUL6', 'JUL7', 'JUL8', 'JUL10', 'JUL11', 'JUL12', 'JUL13', 'JUL14', 'JUL15', 'JUL16', 'JUL17', 'JUL18', 'JUL19', 'JUL20', 'JUL21',
+# 'MOS1', 'MOS2', 'MOS3', 'MOS4', 'MOS5', 'MOS6', 'MOS7', 'MOS8',
+# 'KNUD1', 'KNUD2', 'KNUD3', 'KNUD4', 'KNUD5', 'KNUD7', 'KNUD8', 'KNUD9',
+# 'VIBO1', 'VIBO2', 'VIBO3', 'VIBO4', 'VIBO5', 'VIBO7', 'VIBO9', 'VIBO10']
+
+inds = ['MOS1', 'MOS2']
+
+zebra_genome = '../zebra_mussel_ref.fa' # Path to reference genome
+
+delly_output_files = []
+smoove_output_files = []
+manta_output_dirs = []
+survivor_output_files = []
+for i in inds:
+    print(i)
+    # DELLY
+    T1 = gwf.target_from_template(f"delly_{i}", delly(ID = i, 
+    output_folder = f'{workflow_folder}/delly_output',
+    ref_genome = zebra_genome, 
+    outputs = f'{workflow_folder}/delly_output/{i}_delly.vcf'))
+    delly_output_files.append(T1.outputs[0])
+
+    # Smoove
+    T2 = gwf.target_from_template(f"smoove_{i}", smoove(ID = i, 
+    output_folder = f'{workflow_folder}/smoove_output',
+    ref_genome = zebra_genome, 
+    outputs = f'{workflow_folder}/smoove_output/{i}-smoove.genotyped.vcf'))
+    smoove_output_files.append(T2.outputs[0])
+
+    # Manta
+    T3 = gwf.target_from_template(f"manta_{i}", manta(ID = i, 
+    ref_genome = zebra_genome, 
+    output_folder = f'{workflow_folder}/manta_output',
+    outputs = [
+        f'{workflow_folder}/manta_output/{i}/results/variants/candidateSmallIndels.vcf',
+        f'{workflow_folder}/manta_output/{i}/results/variants/candidateSV.vcf']))
+    manta_output_dirs.append(T3.outputs[0])
+    
+    # SURVIVOR
+    T4 = gwf.target_from_template(f"survivor_{i}", survivor(ID = i, 
+    output_folder = f'{workflow_folder}/survivor_output',
+    inputs = [
+        f"{workflow_folder}/delly_output/{i}_delly.vcf", 
+        f'{workflow_folder}/smoove_output/{i}-smoove.genotyped.vcf', 
+        f"{workflow_folder}/manta_output/{i}/results/variants/candidateSV.vcf",
+        f"{workflow_folder}/manta_output/{i}/results/variants/candidateSmallIndels.vcf"],
+    outputs = [
+        f'{workflow_folder}/survivor_output/{i}_merged.vcf',
+        f'{workflow_folder}/survivor_output/{i}_summary']))
+    survivor_output_files.append(T4.outputs[0])
+        
+    # Removing SVs mapped to "non-chromosomal" scaffolds
+    T5 = gwf.target_from_template(f"removing_unmapped_contigs_{i}", removing_unmapped_contigs(ID = i, 
+    output_folder = f'{workflow_folder}/filtering_output',
+    inputs = f'{workflow_folder}/survivor_output/{i}_merged.vcf',
+    outputs = f'{workflow_folder}/filtering_output/{i}_filtered_contigs.vcf.gz'))
+    
+    # Filtering for mapping quality and coverage
+    T6 = gwf.target_from_template(f"filtering_w_survivor_{i}", filtering_w_survivor(ID = i, 
+    output_folder = f'{workflow_folder}/filtering_output',
+    inputs = [
+        f'../zebra_bam_files/{i}_noPCRdupl.bam', # Path to BAM file of mapped reads
+        f'{workflow_folder}/filtering_output/{i}_filtered_contigs.vcf.gz'],
+    outputs = f'{workflow_folder}/filtering_output/{i}_filtered_w_survivor.vcf'))
+
+
