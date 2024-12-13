@@ -1,3 +1,7 @@
+### Prerequisites: 
+#### A folder of sorted BAM-files with ID's that can be used throughout the workflow. Substitute my 'path to BAM-files' for your own.
+#### Having separate conda environments for gwf, Delly, Manta, Smoove, SURVIVOR and samtools. Substitute your environment names for mine in each function definition.
+
 from gwf import *
 
 #######################################
